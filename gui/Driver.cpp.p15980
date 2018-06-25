@@ -1,0 +1,900 @@
+#include "Driver.h"
+#include <iostream>
+#include "HandlerSerial.h"
+#include <semaphore.h>
+#include <signal.h>
+#include <pthread.h>
+#include "circularVectorTS.hpp"
+
+#define CRC16_GEN 0x1021
+#define CRC16_MSB 0x8000
+
+using namespace std;
+
+
+sem_t mainLoop, recvFsmSem;
+bool running;
+pthread_t recvT, recvFsmT, sendT;
+circularVectorTS<char> * rxBuffer;
+//int setPoint;
+
+bool updateSetPoint;
+
+enum recvStateEnum {
+    RECV_HEADER = 1,
+    RECV_LEN_1,
+    RECV_LEN_2,
+    RECV_DATA,
+    RECV_CRC_1,
+    RECV_CRC_2
+};
+
+recvStateEnum recvState;
+
+
+
+int calcCRC(char * buffer, int length);
+void interruptHandler(int32_t);
+static void * recvHandler(void * params);
+static void * recvFsmHandler(void * params);
+static void * sendHandler(void * params);
+
+
+Driver::Driver() {
+    this->serialDescriptor = new HandlerSerial();
+    sem_init(&this->recvFsmSEM, 0, 0);
+    pthread_mutex_init(&this->rxBufferMUX, NULL);
+    pthread_mutex_init(&this->sendMUX, 0);
+    pthread_cond_init(&this->recvCOND,NULL);
+    this->rxBuffer = new circularVectorTS<char>(1024);
+    this->driverState = DRIVER_STATE_READY;
+    pthread_mutex_init(&this->recvMUX, NULL);
+    sem_init(&this->recvSEM, 0, 0);
+    sem_init(&this->sendSEM, 0, 1);
+}
+
+
+
+void * Driver::recvFsmHandler(void * params) {
+    Driver * thisClass = (Driver*) params;
+    char newChar;
+    int leftBytes;
+    char incomingMsg[1024];
+    int bufPos;
+    FsmRecvState recvState = RECV_HEADER;
+
+    cout << "FSM running" << endl;
+    while (thisClass->driverState != DRIVER_STATE_STOPPED) {
+    sem_wait(&recvFsmSem);
+    while ((thisClass->driverState != DRIVER_STATE_STOPPED)&&(!thisClass->rxBuffer->isEmpty())) {
+        newChar = (thisClass->rxBuffer->tailPop() & 0xFF);
+       // cout << hex << (int)newChar << endl;
+        switch (recvState) {
+        case RECV_HEADER:
+            if (newChar == 0x7E) {
+            recvState = RECV_LENGTH;
+            leftBytes = 0;
+            bufPos = 0;
+            incomingMsg[bufPos] = newChar;
+            bufPos++;
+            }
+        break;
+        case RECV_LENGTH:
+            recvState = RECV_DATA;
+            leftBytes = ((newChar & 0xFF));// << 8);
+            incomingMsg[bufPos] = newChar;
+            bufPos++;
+        break;
+        case RECV_DATA:
+            leftBytes--;
+            incomingMsg[bufPos] = newChar;
+            bufPos++;
+            if (leftBytes <= 0) {
+            recvState = RECV_CRC_1;
+            }
+        break;
+        case RECV_CRC_1:
+            recvState = RECV_CRC_2;
+            incomingMsg[bufPos] = newChar;
+            bufPos++;
+        break;
+        case RECV_CRC_2:
+            incomingMsg[bufPos] = newChar;
+            bufPos++;
+            recvState = RECV_HEADER;
+            if (!calcCRC(incomingMsg, bufPos)) {
+           // cout << "Message complete!! " << bufPos << endl;
+               // cout << "Message: " << (incomingMsg[2]<<8 | incomingMsg[3] & 0xFF) << endl;
+          // for (int i = 0 ; i < bufPos ; i++) {
+         //      cout << i << "->" << hex << (int)incomingMsg[i] << endl;
+          //  }
+           // cout << (int)incomingMsg[7] << endl;
+             //pthread_mutex_lock(&this->responseMUX);
+                memcpy(thisClass->recvResponse, incomingMsg, bufPos);
+                thisClass->len = bufPos;
+          //  pthread_mutex_unlock(&thisClass->recvMUX);
+               // cout << "SIGNALING" << endl;
+                pthread_cond_signal(&thisClass->recvCOND);
+               // sem_post(&thisClass->recvSEM);
+            if (thisClass->recvCB != NULL) {
+              //  thisClass->recvCB(thisClass->cbClass, incomingMsg, bufPos);
+            }
+            } else {
+                cout << "Wrong CRC!!" << endl;
+                thisClass->len = 0;
+                 pthread_cond_signal(&thisClass->recvCOND);
+
+
+            }
+        break;
+        }
+    }
+    }
+
+    return NULL;
+}
+
+void * Driver::recvHandler(void * params) {
+    Driver * thisClass = (Driver *)params;
+    char rxTempBuffer[1024];
+    int nbytes;
+
+    cout << "recvHandler started" << endl;
+    while (thisClass->driverState != DRIVER_STATE_STOPPED) {
+        nbytes = thisClass->serialDescriptor->recv(rxTempBuffer, 255);
+       // cout << "received!! " << nbytes << endl;
+    if (nbytes > 0) {
+
+        thisClass->rxBuffer->headPush(rxTempBuffer, nbytes);
+        sem_post(&recvFsmSem);
+    }
+    }
+    cout << "recvHandler stopped" << endl;
+
+    return NULL;
+}
+
+//struct timespec { long tv_sec; long tv_nsec; };    //header part
+/*
+int clock_gettime(int, struct timespec *spec)      //C-file part
+{  __int64 wintime; GetSystemTimeAsFileTime((FILETIME*)&wintime);
+   wintime      -=116444736000000000LL;  //1jan1601 to 1jan1970
+   spec->tv_sec  =wintime / 10000000LL;           //seconds
+   spec->tv_nsec =wintime % 10000000LL *100;      //nano-seconds
+   return 0;
+}
+*/
+
+
+
+//struct timespec { long tv_sec; long tv_nsec; };   //header part
+#define exp7           10000000LL     //1E+7     //C-file part
+#define exp9         1000000000LL     //1E+9
+#define w2ux 116444736000000000LL     //1.jan1601 to 1.jan1970
+void unix_time(struct timespec *spec)
+{  __int64 wintime; GetSystemTimeAsFileTime((FILETIME*)&wintime);
+   wintime -=w2ux;  spec->tv_sec  =wintime / exp7;
+                    spec->tv_nsec =wintime % exp7 *100;
+}
+int clock_gettime(int, timespec *spec)
+{  static  struct timespec startspec; static double ticks2nano;
+   static __int64 startticks, tps =0;    __int64 tmp, curticks;
+   QueryPerformanceFrequency((LARGE_INTEGER*)&tmp); //some strange system can
+   if (tps !=tmp) { tps =tmp; //init ~~ONCE         //possibly change freq ?
+                    QueryPerformanceCounter((LARGE_INTEGER*)&startticks);
+                    unix_time(&startspec); ticks2nano =(double)exp9 / tps; }
+   QueryPerformanceCounter((LARGE_INTEGER*)&curticks); curticks -=startticks;
+   spec->tv_sec  =startspec.tv_sec   +         (curticks / tps);
+   spec->tv_nsec =startspec.tv_nsec  + (double)(curticks % tps) * ticks2nano;
+         if (!(spec->tv_nsec < exp9)) { spec->tv_sec++; spec->tv_nsec -=exp9; }
+   return 0;
+}
+
+bool Driver::start() {
+    bool bOk = true;
+    cout << "Starting driver!!" << endl;
+    if (this->driverState == DRIVER_STATE_READY) {
+        if (!this->serialDescriptor->start()) {
+            pthread_create(&recvHandlerTID, NULL, Driver::recvHandler, this);
+            pthread_create(&recvFsmHandlerTID, NULL, Driver::recvFsmHandler, this);
+            this->driverState = DRIVER_STATE_RUNNING;
+        } else {
+            bOk = false;
+        }
+    } else {
+        cout << "[ERROR] Unable to start driver, not ready..." << endl;
+        bOk = false;
+    }
+   // recvState = RECV_HEADER;
+    return bOk;
+}
+
+bool Driver::stop() {
+    bool bOk = false;
+
+    if (this->driverState != DRIVER_STATE_STOPPED) {
+        this->driverState = DRIVER_STATE_STOPPED;
+        this->serialDescriptor->stop();
+        sem_post(&recvFsmSem);
+        cout << "Closing Receive thread..." << endl;
+        pthread_join(recvHandlerTID, NULL);
+        cout << "Closing FSM thread..." << endl;
+        pthread_join(recvFsmHandlerTID, NULL);
+        cout << "eMotion driver stopped" << endl;
+        bOk = true;
+    }
+    this->driverState = DRIVER_STATE_READY;
+
+    return bOk;
+}
+
+bool Driver::setRecvCB(void *(*cbFunction)(void *, char *, int), void * funcClass) {
+    bool bOk = false;
+
+    this->recvCB = cbFunction;
+    this->cbClass = funcClass;
+    bOk = true;
+
+    return bOk;
+}
+
+
+bool Driver::send(char * buffer, int len, char * response, int * lenResponse) {
+    bool bOk = false;
+    timespec ts;
+
+    if (this->driverState == DRIVER_STATE_RUNNING) {
+        pthread_mutex_lock(&this->sendMUX);
+
+
+        updateSetPoint = false;
+        int8_t str[] = "\x7e\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xFF\xFF";
+        str[1] = ((len + 2)) & 0xFF;
+
+        str[2] = 0;
+        str[3] = 0;
+
+        memcpy(&str[4], buffer, len);
+
+        int crc = calcCRC((char *)str, len+4);
+        str[len + 4] = (crc >> 8) & 0xFF;
+        str[len + 4 +1] = crc & 0xFF;
+  //     for (int i = 0 ; i<(len+4+2) ; i++) {
+   //         cout << i << "->" << hex << (int)str[i] << endl;
+//}
+timespec sendTS;
+        //this->len = 0;
+       // this->recvResponse = NULL;
+        this->serialDescriptor->send((char *)str, len + 4 + 2);
+        clock_gettime(0, &ts);
+         clock_gettime(0, &sendTS);
+        ts.tv_nsec += 100000000;
+        ts.tv_sec += ts.tv_nsec / 1000000000L;
+        ts.tv_nsec = ts.tv_nsec % 1000000000L;
+        //ts.tv_nsec += 800000000;
+        int rc = pthread_cond_timedwait(&this->recvCOND, &this->recvMUX, &ts);
+        //TODO check rc
+        if (rc == ETIMEDOUT) {
+            cout << "[ERROR] Timeout while receiving board telemetry" << endl;
+        } else {
+            if (this->len > 0) {
+                if ((response != NULL)) {
+                    if ((this->recvResponse[5]) == str[5]) {
+                        timespec recvTS;
+                        clock_gettime(0, &recvTS);
+                        float delay = (recvTS.tv_sec - sendTS.tv_sec)*1000000.0 + (recvTS.tv_nsec - sendTS.tv_nsec)/1000.0;
+                        cout << "dt: " << delay << "us" << endl;
+                        memcpy(response, this->recvResponse, this->len);
+                        *lenResponse = this->len;
+                    //cout << "RECV " << (int)this->len << endl;
+                        bOk = true;
+                    } else {
+                      cout << "[WARNING] Wrong Command code received: " << (int)this->recvResponse[5] << " expected: " << (int)str[5] << endl;
+                        //        for (int i = 0 ; i<(this->len) ; i++) {
+                          //          cout << i << "->" << hex << (int)str[i] << endl;
+                        //}
+                    }
+                }
+            } else {
+                cout << "Bad CRC message" << endl;
+            }
+        }
+       // pthread_mutex_unlock(&this->recvMUX);
+    pthread_mutex_unlock(&this->sendMUX);
+    }
+      //  sem_post(&this->sendSEM);
+  //  cout << "UNLOCK" << endl;
+
+    return bOk;
+}
+
+
+bool Driver::setSetpoint(int16_t setPoint) {
+
+    bool bOk = false;
+    char resp[1024];
+//    int lenresp;
+    updateSetPoint = false;
+
+    if (this->driverState == DRIVER_STATE_RUNNING) {
+       // cout << "SETTING" << endl;
+    int8_t str[] = "\x01\x00\x00\x00";
+    str[0] = PACKET_CODE_SET;
+    str[1] = MESSAGE_CODE_SETPOINT;
+    str[2] = (setPoint >> 8) & 0xFF;
+    str[3] = (setPoint) & 0xFF;
+    send((char *)str, 4, NULL, NULL);
+
+    //TODO check response ACK/NACK
+    bOk = true;
+    }
+
+    return bOk;
+}
+
+
+
+bool Driver::setKp(uint16_t Kp) {
+
+    bool bOk = false;
+    char resp[1024];
+//    int lenresp;
+    updateSetPoint = false;
+
+    cout << "Setting kp " << Kp << endl;
+    if (this->driverState == DRIVER_STATE_RUNNING) {
+        int8_t str[] = "\x01\x00\x00\x00";
+        str[0] = 1;
+        str[1] = MESSAGE_CODE_KP;
+        str[2] = (Kp >> 8) & 0xFF;
+        str[3] = (Kp) & 0xFF;
+        send((char *)str, 4, NULL, NULL);
+
+        //TODO check response ACK/NACK
+        bOk = true;
+    }
+
+    return bOk;
+}
+
+
+
+bool Driver::setKi(uint16_t Ki) {
+
+    bool bOk = false;
+    char resp[1024];
+//    int lenresp;
+    updateSetPoint = false;
+
+    cout << "Setting ki " << Ki << endl;
+    if (this->driverState == DRIVER_STATE_RUNNING) {
+        int8_t str[] = "\x01\x00\x00\x00";
+        str[0] = 1;
+        str[1] = MESSAGE_CODE_KI;
+        str[2] = (Ki >> 8) & 0xFF;
+        str[3] = (Ki) & 0xFF;
+        send((char *)str, 4, NULL, NULL);
+
+        //TODO check response ACK/NACK
+        bOk = true;
+    }
+
+    return bOk;
+}
+
+
+
+bool Driver::setKd(uint16_t Kd) {
+
+    bool bOk = false;
+    char resp[1024];
+//    int lenresp;
+    updateSetPoint = false;
+
+    cout << "Setting kd " << Kd << endl;
+    if (this->driverState == DRIVER_STATE_RUNNING) {
+        int8_t str[] = "\x01\x00\x00\x00";
+        str[0] = 1;
+        str[1] = MESSAGE_CODE_KD;
+        str[2] = (Kd >> 8) & 0xFF;
+        str[3] = (Kd) & 0xFF;
+        send((char *)str, 4, NULL, NULL);
+
+        //TODO check response ACK/NACK
+        bOk = true;
+    }
+
+    return bOk;
+}
+
+
+bool Driver::setActiveBrake(bool value) {
+    bool bOk = false;
+    char resp[1024];
+//    int lenresp;
+    updateSetPoint = false;
+
+    cout << "Setting regenbrake " << value << endl;
+    if (this->driverState == DRIVER_STATE_RUNNING) {
+        int8_t str[] = "\x01\x00\x00\x00";
+        str[0] = 1;
+        str[1] = MESSAGE_CODE_REGEN_BRAKE;
+        str[2] = value;
+        send((char *)str, 3, NULL, NULL);
+
+        //TODO check response ACK/NACK
+        bOk = true;
+    }
+
+    return bOk;
+}
+
+bool Driver::setEmergencyBrake() {
+    bool bOk = false;
+    char resp[1024];
+//    int lenresp;
+    updateSetPoint = false;
+
+   // cout << "Setting regenbrake " << value << endl;
+    if (this->driverState == DRIVER_STATE_RUNNING) {
+        int8_t str[] = "\x01\x00\x00\x00";
+        str[0] = 1;
+        str[1] = MESSAGE_CODE_EMERGENCY_BRAKE;
+        //str[2] = value;
+        send((char *)str, 2, NULL, NULL);
+
+        //TODO check response ACK/NACK
+        bOk = true;
+    }
+
+    return bOk;
+}
+
+
+bool Driver::setOvercurrent(float value) {
+    bool bOk = false;
+    char resp[1024];
+//    int lenresp;
+    updateSetPoint = false;
+
+    cout << "Setting regenbrake " << value << endl;
+    if (this->driverState == DRIVER_STATE_RUNNING) {
+        int8_t str[] = "\x01\x00\x00\x00";
+        str[0] = 1;
+        str[1] = MESSAGE_CODE_OVERCURRENT;
+        str[2] = value*10.0;
+        send((char *)str, 3, NULL, NULL);
+
+        //TODO check response ACK/NACK
+        bOk = true;
+    }
+
+    return bOk;
+}
+
+bool Driver::setOvervoltage(float value) {
+    bool bOk = false;
+    char resp[1024];
+//    int lenresp;
+    updateSetPoint = false;
+    uint16_t val = (value * 10.0);
+
+    cout << "Setting regenbrake " << value << endl;
+    if (this->driverState == DRIVER_STATE_RUNNING) {
+        int8_t str[] = "\x01\x00\x00\x00";
+        str[0] = 1;
+        str[1] = MESSAGE_CODE_OVERVOLTAGE;
+        str[2] = ((val)>> 8) & 0xFF;
+        str[3] = val & 0xFF;
+        send((char *)str, 4, NULL, NULL);
+
+        //TODO check response ACK/NACK
+        bOk = true;
+    }
+
+    return bOk;
+}
+
+bool Driver::setOvertemperature(uint8_t value) {
+    bool bOk = false;
+    char resp[1024];
+//    int lenresp;
+    updateSetPoint = false;
+
+    cout << "Setting regenbrake " << value << endl;
+    if (this->driverState == DRIVER_STATE_RUNNING) {
+        int8_t str[] = "\x01\x00\x00\x00";
+        str[0] = 1;
+        str[1] = MESSAGE_CODE_OVERTEMPERATURE;
+        str[2] = value;
+        send((char *)str, 3, NULL, NULL);
+
+        //TODO check response ACK/NACK
+        bOk = true;
+    }
+
+    return bOk;
+}
+
+
+
+int calcCRC(char * buffer, int length) {
+    int16_t crcbin, crcOverflow, input;
+    int j, i;
+    char c;
+    crcbin = 0xFFFF;
+
+    for (j=0; j<length; j++) {
+    c = buffer[j] & 0xFF;
+    for (i = 0x80; i ; i>>=1) {
+        crcOverflow = crcbin & CRC16_MSB;
+        input = ((i&c) ? CRC16_MSB : 0);
+        crcbin <<= 1;
+        if (input^crcOverflow) crcbin ^= CRC16_GEN;
+    }
+    }
+
+    return crcbin;
+}
+
+//void interruptHandler(int32_t signal) {
+//    //TODO check signal
+//    cout << "Signal caught, stopping..." << endl;
+//    running = false;
+//    sem_post(&mainLoop);
+//    sem_post(&recvFsmSem);
+//}
+
+bool Driver::setPort(char * fileName) {
+    bool bOk = false;
+    this->serialDescriptor->setFilename(fileName);
+
+    return bOk;
+}
+
+bool Driver::setBaud(int baudRate) {
+    bool bOk = false;
+    this->serialDescriptor->setBaud(baudRate);
+
+    return bOk;
+}
+
+
+bool Driver::fetchRegister(char * buffer, int requestLen, char * response, int * len) {
+    bool bOk = false;
+    if (this->driverState == DRIVER_STATE_RUNNING) {
+        bOk = send(buffer, requestLen, response, len);
+
+    } else {
+        cout << "[ERROR] Driver is not running" << endl;
+    }
+
+    return bOk;
+}
+
+bool Driver::writeRegister(char * buffer, int len) {
+    bool bOk = false;
+    char response[255];
+    int respLen;
+
+    if (this->driverState == DRIVER_STATE_RUNNING) {
+        bOk = send(buffer, len, response, &respLen);
+
+    }
+
+    return bOk;
+}
+
+
+bool Driver::getKp(uint16_t * Kp) {
+    bool bOk = false;
+    char response[255];
+    char request[] = "\x00\x04";
+    request[1] = MESSAGE_CODE_KP;
+    int len;
+    bOk = fetchRegister(request, 2, response, &len);
+    if (bOk) *Kp = ((response[len-4]<<8)+(response[len-3]&0xFF));
+
+    return bOk;
+}
+
+bool Driver::getKi(uint16_t * Ki) {
+    bool bOk = false;
+    char response[255];
+    char request[] = "\x00\x05";
+    request[1] = MESSAGE_CODE_KI;
+    int len;
+    bOk = fetchRegister(request, 2, response, &len);
+    if (bOk) *Ki = ((response[len-4]<<8)+(response[len-3]&0xFF));
+
+    return bOk;
+}
+
+
+bool Driver::getKd(uint16_t * Kd) {
+    bool bOk = false;
+    char response[255];
+    char request[] = "\x00\x06";
+     request[1] = MESSAGE_CODE_KD;
+    int len;
+    bOk = fetchRegister(request, 2, response, &len);
+    if (bOk) *Kd = ((response[len-4]<<8)+(response[len-3]&0xFF));
+
+    return bOk;
+}
+
+bool Driver::getPWMFreq(uint16_t * freq) {
+    bool bOk = false;
+    char response[255];
+    char request[] = "\x00\x07";
+     request[1] = MESSAGE_CODE_PWM_FREQ;
+    int len;
+    bOk = fetchRegister(request, 2, response, &len);
+    if (bOk) *freq = ((response[len-4]<<8)+(response[len-3]&0xFF));
+    cout << "pwwm " << *freq << endl;
+
+    return bOk;
+}
+
+bool Driver::getVoltage(float * voltage) {
+    bool bOk = false;
+    char response[255];
+    int16_t responseInt;
+    char request[] = "\x00\x09";
+     request[1] = MESSAGE_CODE_VOLTAGE;
+    int len;
+    bOk = fetchRegister(request, 2, response, &len);
+    if (bOk) {
+        responseInt = ((response[len-4]<<8)+(response[len-3]&0xFF));
+        *voltage = responseInt / 10.0;
+    }
+
+    return bOk;
+}
+
+
+bool Driver::getSpeed(int * speed) {
+    bool bOk = false;
+    char response[255];
+    char request[] = "\x00\x02";
+    request[1] = MESSAGE_CODE_MOTOR_SPEED;
+    int len;
+    bOk = fetchRegister(request, 2, response, &len);
+    if (bOk) *speed = ((response[len-4]<<8)+(response[len-3]&0xFF));
+
+    return bOk;
+}
+
+
+bool Driver::getCurrent(float * current) {
+    bool bOk = false;
+    char response[255];
+    int16_t responseInt;
+    char request[] = "\x00\x07";
+    request[1] = MESSAGE_CODE_CURRENT;
+    int len;
+    bOk = fetchRegister(request, 2, response, &len);
+    if (bOk) {
+        responseInt = ((response[len-4]<<8)+(response[len-3]&0xFF));
+        *current = responseInt/100.0;//((responseInt+35.0)/ 1000.0)*0.3;
+//        cout << "current " << *current << endl;
+    }
+
+    return bOk;
+ }
+
+
+bool Driver::getTemperature(float * temperature) {
+    bool bOk = false;
+    char response[255];
+    char request[] = "\x00\x09";
+     request[1] = MESSAGE_CODE_TEMPERATURE;
+    int len;
+    bOk = fetchRegister(request, 2, response, &len);
+    if (bOk) *temperature = ((response[len-4]<<8)+(response[len-3]&0xFF))/10.0;
+
+    return bOk;
+ }
+
+
+bool Driver::getControlMode(ControlMode * mode) {
+    bool bOk = false;
+    char response[255];
+    char request[] = "\x00\x01";
+    request[0] = PACKET_CODE_GET;
+    request[1] = MESSAGE_CODE_CONTROL_MODE;
+    int len;
+    bOk = fetchRegister(request, 2, response, &len);
+    if (bOk) *mode = (ControlMode)(response[len-3]);
+
+    return bOk;
+ }
+
+bool Driver::getPower(int16_t * power) {
+    bool bOk = false;
+    char response[255];
+    char request[] = "\x00\x02";
+    request[1] = 11;
+    int len;
+    bOk = fetchRegister(request, 2, response, &len);
+    if (bOk) *power = ((response[len-4]<<8)+(response[len-3]&0xFF));
+
+    return bOk;
+}
+
+bool Driver::getCounts(int32_t * counts) {
+    bool bOk = false;
+    char response[255];
+    char request[] = "\x00\x02";
+    request[1] = 12;
+    int len;
+    bOk = fetchRegister(request, 2, response, &len);
+    if (bOk) {
+        *counts = ((response[len-6]&0xFF)<< 24) + ((response[len-5]&0xFF)<<16) + ((response[len-4]&0xFF)<<8) + (response[len-3]&0xFF);
+    }
+
+    return bOk;
+}
+
+bool Driver::getActiveBrake(bool * regen) {
+    bool bOk = false;
+    char response[255];
+    char request[] = "\x00\x02";
+    request[1] = 13;
+    int len;
+    bOk = fetchRegister(request, 2, response, &len);
+    if (bOk) *regen = response[len-3];
+
+    return bOk;
+}
+
+
+bool Driver::getOvercurrent(float * val) {
+    bool bOk = false;
+    char response[255];
+    char request[] = "\x00\x02";
+    request[1] = 14;
+    int len;
+    bOk = fetchRegister(request, 2, response, &len);
+    if (bOk) *val = (((uint8_t)response[len-3]) / 10.0);
+
+    return bOk;
+}
+
+
+bool Driver::getOvervoltage(float * val) {
+    bool bOk = false;
+    char response[255];
+    char request[] = "\x00\x02";
+    request[1] = 15;
+    int len;
+    bOk = fetchRegister(request, 2, response, &len);
+    if (bOk) *val = ((((response[len-4]<<8)+(response[len-3]&0xFF))) / 10.0);
+
+    return bOk;
+}
+
+
+bool Driver::getOvertemperature(uint8_t * val) {
+    bool bOk = false;
+    char response[255];
+    char request[] = "\x00\x02";
+    request[1] = 16;
+    int len;
+    bOk = fetchRegister(request, 2, response, &len);
+    if (bOk) *val = response[len-3];
+
+    return bOk;
+}
+
+bool Driver::getFaultFlags(bool * safetyBrake, bool * emergencyBrake, bool * overcurrent, bool * overvoltage, bool * overtemperature) {
+    bool bOk = false;
+    char response[255];
+    char request[] = "\x00\x02";
+    request[1] = MESSAGE_CODE_FAULT_FLAGS;
+    int len;
+    bOk = fetchRegister(request, 2, response, &len);
+    if (bOk) {
+    //    *val = response[len-3];
+        *safetyBrake = ((response[len-3] >> 4) & 1);
+        *emergencyBrake = ((response[len-3] >> 3) & 1);
+        *overcurrent = ((response[len-3] >> 2) & 1);
+        *overvoltage = ((response[len-3] >> 1) & 1);
+        *overtemperature= ((response[len-3] >> 0) & 1);
+    }
+
+    return bOk;
+}
+
+bool Driver::setControlMode(ControlMode mode) {
+    bool bOk = false;
+    char request[] = "\x01\x01\x00";
+
+    if (this->driverState == DRIVER_STATE_RUNNING) {
+        request[0] = PACKET_CODE_SET;
+        request[1] = MESSAGE_CODE_CONTROL_MODE;
+        request[2] = mode;
+        bOk = writeRegister((char *)request, 3);
+    }
+
+    return bOk;
+ }
+
+bool Driver::setPWMFreq(uint16_t freq) {
+    bool bOk = false;
+    char response[255];
+    char request[] = "\x01\x07\x00";
+   //  request[1] = MESSAGE_CODE_PWM_FREQ;
+    //int len;
+   // bOk = fetchRegister(request, 2, response, &len);
+    //if (bOk) *freq = ((response[len-4]<<8)+(response[len-3]&0xFF));
+     if (this->driverState == DRIVER_STATE_RUNNING) {
+         request[0] = PACKET_CODE_SET;
+                 request[1] = MESSAGE_CODE_PWM_FREQ;
+                 request[2] = 0;
+                  request[3] = freq&0xFF;
+                 cout << "pwm: "<< freq << endl;
+                 bOk = writeRegister((char *)request, 4);
+     }
+
+    return bOk;
+}
+
+
+bool Driver::releaseSafetyBrake() {
+    bool bOk = false;
+    char response[255];
+    char request[] = "\x01\x07\x00";
+   //  request[1] = MESSAGE_CODE_PWM_FREQ;
+    //int len;
+   // bOk = fetchRegister(request, 2, response, &len);
+    //if (bOk) *freq = ((response[len-4]<<8)+(response[len-3]&0xFF));
+     if (this->driverState == DRIVER_STATE_RUNNING) {
+         request[0] = PACKET_CODE_SET;
+                 request[1] = MESSAGE_CODE_RELEASE_SAFETY_BRAKE;
+                 request[2] = 0;
+                  request[3] = 0;//freq&0xFF;
+                // cout << "pwm: "<< freq << endl;
+                  cout << "RELEASING" << endl;
+                 bOk = writeRegister((char *)request, 4);
+     }
+
+    return bOk;
+}
+
+
+ bool Driver::setSPWMFrequency(uint32_t freq) {
+     bool bOk = false;
+     char response[255];
+     char request[] = "\x01\x07\x00\x00\x00\x00\x00\x00";
+    //  request[1] = MESSAGE_CODE_PWM_FREQ;
+     //int len;
+    // bOk = fetchRegister(request, 2, response, &len);
+     //if (bOk) *freq = ((response[len-4]<<8)+(response[len-3]&0xFF));
+      if (this->driverState == DRIVER_STATE_RUNNING) {
+          request[0] = PACKET_CODE_SET;
+                  request[1] = MESSAGE_CODE_SPWM_FREQ;
+                   request[2] = (freq>>24)&0xFF;
+                   request[3] = (freq>>16)&0xFF;
+                   request[4] = (freq>>8)&0xFF;
+                   request[5] = (freq>>0)&0xFF;
+                  cout << "pwm: "<< freq << endl;
+                  bOk = writeRegister((char *)request, 6);
+      }
+
+     return bOk;
+ }
+
+ bool Driver::setOutputSignalType(OutputSignal mode) {
+     bool bOk = false;
+     char request[] = "\x01\x01\x00";
+
+     if (this->driverState == DRIVER_STATE_RUNNING) {
+         request[0] = PACKET_CODE_SET;
+         request[1] = MESSAGE_CODE_OUTPUT_SIGNAL;
+         request[2] = mode;
+         bOk = writeRegister((char *)request, 3);
+     }
+
+     return bOk;
+  }
